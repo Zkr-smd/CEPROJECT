@@ -1,25 +1,30 @@
-#define FILTER_TAP_NUM 32
+const int micPin = A0;      // Micro branché sur A0
+const float attenuation = 0.0316; // -30 dB en amplitude
+const int sampleRate = 8000; // 8 kHz (ajustable)
+unsigned long lastSampleMicros = 0;
+const int intervalMicros = 1000000 / sampleRate;
 
-float firCoeffs[FILTER_TAP_NUM] = { /* paste your real coeffs here */ };
-float firBuffer[FILTER_TAP_NUM] = {0};
-uint8_t bufferIndex = 0;
+void setup() {
+  analogReadResolution(12);
+  Serial.begin(115200);
+}
 
-float applyFIRFilter(float input) {
-  firBuffer[bufferIndex] = input;
+void loop() {
+  unsigned long now = micros();
+  if (now - lastSampleMicros >= intervalMicros) {
+    lastSampleMicros = now;
 
-  float output = 0.0;
-  uint8_t index = bufferIndex;
-  for (uint8_t i = 0; i < FILTER_TAP_NUM; i++) {
-    output += firCoeffs[i] * firBuffer[index];
-    if (index == 0)
-      index = FILTER_TAP_NUM - 1;
-    else
-      index--;
+    int raw = analogRead(micPin);
+    float centered = raw - 2048.0;
+    float attenuated = centered * attenuation;
+
+    int output = (int)(attenuated + 2048);
+    output = constrain(output, 0, 4095); 
+
+    byte highByte = (output >> 8) & 0x0F;
+    byte lowByte = output & 0xFF;
+
+    Serial.write(highByte); 
+    Serial.write(lowByte); 
   }
-
-  bufferIndex++;
-  if (bufferIndex >= FILTER_TAP_NUM)
-    bufferIndex = 0;
-
-  return output;
 }
