@@ -42,3 +42,9 @@ void setupTimer() {
   TC0->TC_CHANNEL[0].TC_IDR = ~TC_IER_CPCS;
   NVIC_EnableIRQ(TC0_IRQn);
 }
+
+// Routine d’interruption
+void TC0_Handler() {
+  TC_GetStatus(TC0, 0); // Clear l'interruption
+  sampleReady = true;
+}
