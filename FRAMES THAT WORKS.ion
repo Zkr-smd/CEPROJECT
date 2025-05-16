@@ -1,0 +1,182 @@
+#include <Arduino.h>
+
+// === Config ===
+#define FILTER_TAP_CNT   67
+#define RC              1312            // timer reload for ~32 kHz
+#define DECIMATION       4
+#define FS_RAW        32000UL           // ≃ 32 kHz from timer
+#define FRAME_SIZE      256
+#define HOP_LENGTH      128
+#define NUM_FRAMES      61
+#define TARGET_SAMPLES  (FRAME_SIZE + HOP_LENGTH*(NUM_FRAMES-1))  // = 256 + 128×60 = 7936
+#define PIN_TIMER       13
+
+// === FIR taps ===
+const int16_t filter_taps[FILTER_TAP_CNT] = {
+  195, 550, 674, 919, 900, 740, 382, -26, -371, -513, -410, -108, 253, 500, 503, 244,
+  -169, -540, -669, -457,  34, 590, 927, 823, 237, -633, -1394, -1600, -929, 661, 2878,
+  5167, 6883, 7519, 6883, 5167, 2878, 661, -929, -1600, -1394, -633, 237, 823, 927, 590,
+   34, -457, -669, -540, -169, 244, 503, 500, 253, -108, -410, -513, -371, -26, 382, 740,
+  900, 919, 674, 550, 195
+};
+
+// circular raw buffer for convolution
+volatile int16_t  rawBuf[FILTER_TAP_CNT] = {0};
+volatile uint16_t bufIndex     = 0;
+volatile uint16_t decimCounter = 0;
+volatile uint16_t sampleCount  = 0;
+bool dataReady = false;
+
+// store up to 8 000 decimated samples (we'll only fill TARGET_SAMPLES)
+uint16_t decSamples[FS_RAW/DECIMATION];
+
+void setupADC() {
+  pmc_enable_periph_clk(ID_ADC);
+  ADC->ADC_MR = ADC_MR_TRGEN_DIS
+              | ADC_MR_LOWRES_BITS_12
+              | ADC_MR_FREERUN_OFF
+              | ADC_MR_PRESCAL(3)
+              | ADC_MR_STARTUP_SUT64
+              | ADC_MR_TRANSFER(16)
+              | ADC_MR_TRACKTIM(0);
+  ADC->ADC_CHER = ADC_CHER_CH7;  // A0 = channel 7
+}
+
+void setupTimer() {
+  pmc_enable_periph_clk(ID_TC0);
+  TC0->TC_CHANNEL[0].TC_CMR = TC_CMR_WAVE
+                            | TC_CMR_TCCLKS_TIMER_CLOCK1
+                            | TC_CMR_WAVSEL_UP_RC;
+  TC0->TC_CHANNEL[0].TC_RC  = RC;
+  TC0->TC_CHANNEL[0].TC_IER = TC_IER_CPCS;
+  NVIC_EnableIRQ(TC0_IRQn);
+}
+
+void recordSample() {
+  // 1) read ADC
+  while ((ADC->ADC_ISR & ADC_ISR_EOC7) == 0);
+  rawBuf[bufIndex] = ADC->ADC_CDR[7];
+
+  // 2) advance circular index
+  bufIndex = (bufIndex + 1) % FILTER_TAP_CNT;
+
+  // 3) FIR convolution
+  int32_t acc = 0;
+  uint16_t idx = bufIndex;
+  for (uint16_t i = 0; i < FILTER_TAP_CNT; i++) {
+    if (idx == 0) idx = FILTER_TAP_CNT - 1;
+    else          idx--;
+    acc += (int32_t)filter_taps[i] * rawBuf[idx];
+  }
+
+  // 4) decimate
+  if (++decimCounter >= DECIMATION) {
+    decimCounter = 0;
+    int32_t val = acc >> 15;             // Q15→12-bit
+    val = constrain(val, 0, 4095);
+    decSamples[sampleCount++] = (uint16_t)val;
+
+    // stop as soon as we have enough for 61 frames
+    if (sampleCount >= TARGET_SAMPLES) {
+      TC0->TC_CHANNEL[0].TC_IDR = TC_IER_CPCS;  // disable timer interrupt
+      dataReady = true;
+    }
+  }
+}
+
+// IRQ handler
+extern "C" void TC0_Handler() {
+  TC0->TC_CHANNEL[0].TC_SR;        // clear interrupt flag
+  digitalWrite(PIN_TIMER, !digitalRead(PIN_TIMER));
+  ADC->ADC_CR = ADC_CR_START;      // start ADC conversion
+  recordSample();
+}
+
+void setup() {
+  Serial.begin(460800);
+  pinMode(PIN_TIMER, OUTPUT);
+  setupADC();
+  setupTimer();
+  // kick off the timer
+  TC0->TC_CHANNEL[0].TC_CCR = TC_CCR_CLKEN | TC_CCR_SWTRG;
+}
+
+void loop() {
+  if (!dataReady) return;
+
+  // Print all 61 frames with frame numbers and details
+  for (uint16_t f = 0; f < NUM_FRAMES; f++) {
+    uint16_t base = f * HOP_LENGTH;
+    
+    // Print frame header
+    Serial.print("Frame ");
+    Serial.print(f+1);
+    Serial.print("/");
+    Serial.print(NUM_FRAMES);
+    Serial.print(" (samples ");
+    Serial.print(base);
+    Serial.print(" to ");
+    Serial.print(base + FRAME_SIZE - 1);
+    Serial.println("):");
+    
+    // Print frame samples
+    for (uint16_t i = 0; i < FRAME_SIZE; i++) {
+      Serial.println(decSamples[base + i]);
+    }
+    Serial.println();  // blank line between frames
+  }
+
+  // don't re-print
+  dataReady = false;
+}
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////PY PARRT /////////////////////////////////////////////////////////////////////////////////////
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Read the file content
+with open('KHRA.txt', 'rb') as f:
+    content = f.read().decode('utf-8', errors='ignore')
+
+# Split the content into frames
+frames = content.split('Frame ')[1:]
+
+# Process each frame
+for i, frame in enumerate(frames):
+    # Extract frame number and samples info
+    header, *data = frame.split('\n')
+    frame_num = header.split('/')[0]
+    
+    # Convert data to integers
+    values = []
+    for line in data:
+        if line.strip():  # Skip empty lines
+            try:
+                values.append(int(line.strip()))
+            except ValueError:
+                continue
+    
+    # Plot the frame
+    plt.figure(figsize=(10, 6))
+    plt.plot(values, 'b-')
+    plt.title(f'Frame {frame_num}')
+    plt.xlabel('Sample Index')
+    plt.ylabel('Value')
+    plt.grid(True)
+    
+    # Save the plot
+    plt.savefig(f'frame_{frame_num}.png')
+    plt.close()
+
+print(f"Plots saved for {len(frames)} frames")
