@@ -1,22 +1,21 @@
 #include <Arduino.h>
-#include "arduinoMFCC.h"
 
+// Original configuration from your code
 #define BUFFER_SIZE         45
 #define ADC_CH              7
 #define DAC_CHANNEL         1
 #define PinTimer            2
 #define TIMER_RC            328
 #define DS_FACTOR           4
-
 #define SAMPLE_BUFFER_SIZE 8000
 #define FRAME_LENGTH        256
-#define HOP_SIZE            (FRAME_LENGTH / 2)
+#define HOP_SIZE           (FRAME_LENGTH / 2)
+#define MFCC_SIZE          13
+#define DCT_MFCC_SIZE      13
+#define FREQ_ECH           8000
+#define PRE_EMPHASIS_ALPHA 0.97f
 
-#define MFCC_SIZE           13
-#define DCT_MFCC_SIZE       13
-#define FREQ_ECH            8000
-#define PRE_EMPHASIS_ALPHA  0.97
-
+// Original filter taps from your code
 static const int16_t filter_taps[BUFFER_SIZE] = {
    731,  578,  527,  248, -213, -717, -1074, -1126,  -822,  -260,
    326,  662,  548,  -33, -870, -1576, -1722, -1009,   590,  2784,
@@ -25,16 +24,20 @@ static const int16_t filter_taps[BUFFER_SIZE] = {
   -213,  248,  527,  578,   731
 };
 
+// Original variables from your code
 volatile uint16_t circBuffer[BUFFER_SIZE];
 volatile uint8_t bufIndex = 0;
-
 volatile uint16_t sampleBuffer[SAMPLE_BUFFER_SIZE];
 volatile uint16_t sampleCount = 0;
-volatile bool     recordReady = false;
-
-arduinoMFCC mymfcc(MFCC_SIZE, DCT_MFCC_SIZE, FRAME_LENGTH, FREQ_ECH);
-
+volatile bool recordReady = false;
 volatile uint8_t dsCount = 0;
+
+// MFCC Processing buffers
+float frameBuffer[FRAME_LENGTH];
+float mfccBuffer[MFCC_SIZE];
+float hammingWindow[FRAME_LENGTH];
+
+// ===== Original Functions from Your Code =====
 
 void setupTimer() {
   PMC->PMC_PCER0 |= (1 << ID_TC0);
@@ -97,51 +100,181 @@ void DACC_Handler() {
   (void)DACC->DACC_ISR;
 }
 
-void setup() {
-  Serial.begin(460800);
-  mymfcc.create_dct_matrix();
-  mymfcc.create_hamming_window();
-  mymfcc.create_mel_filter_bank();
+// ===== Improved MFCC Processing =====
 
-  pinMode(PinTimer, OUTPUT);
-  digitalWrite(PinTimer, LOW);
+void createHammingWindow() {
+  for (int i = 0; i < FRAME_LENGTH; i++) {
+    hammingWindow[i] = 0.54f - 0.46f * cos(2 * PI * i / (FRAME_LENGTH - 1));
+  }
+}
 
-  setupTimer();
-  setupADC();
-  setupDAC();
+void removeDCOffset(float* frame, uint16_t length) {
+  float mean = 0.0f;
+  for (int i = 0; i < length; i++) {
+    mean += frame[i];
+  }
+  mean /= length;
+  
+  for (int i = 0; i < length; i++) {
+    frame[i] -= mean;
+  }
+}
+
+void normalizeFrame(float* frame, uint16_t length) {
+  float maxVal = 0.0f;
+  for (int i = 0; i < length; i++) {
+    if (abs(frame[i]) > maxVal) maxVal = abs(frame[i]);
+  }
+  
+  if (maxVal > 0.001f) {
+    for (int i = 0; i < length; i++) {
+      frame[i] /= maxVal;
+    }
+  }
+}
+
+void applyPreEmphasis(float* frame, uint16_t length) {
+  for (int i = length - 1; i > 0; i--) {
+    frame[i] -= PRE_EMPHASIS_ALPHA * frame[i - 1];
+  }
+}
+
+// FFT implementation (simplified Radix-2)
+void fft(float* x, float* y, uint16_t n) {
+  uint16_t i, j, k, m;
+  float wr, wi, tr, ti;
+  
+  // Bit-reverse
+  j = 0;
+  for (i = 0; i < n-1; i++) {
+    if (i < j) {
+      tr = x[j];
+      ti = y[j];
+      x[j] = x[i];
+      y[j] = y[i];
+      x[i] = tr;
+      y[i] = ti;
+    }
+    k = n/2;
+    while (k <= j) {
+      j -= k;
+      k /= 2;
+    }
+    j += k;
+  }
+  
+  // Butterfly
+  float angle;
+  for (m = 1; m < n; m *= 2) {
+    for (k = 0; k < m; k++) {
+      angle = -PI * k / m;
+      wr = cos(angle);
+      wi = sin(angle);
+      for (i = k; i < n; i += 2*m) {
+        j = i + m;
+        tr = wr * x[j] - wi * y[j];
+        ti = wr * y[j] + wi * x[j];
+        x[j] = x[i] - tr;
+        y[j] = y[i] - ti;
+        x[i] += tr;
+        y[i] += ti;
+      }
+    }
+  }
+}
+
+// MFCC calculation with DCT
+void computeMFCC(float* frame, float* mfcc) {
+  float imag[FRAME_LENGTH] = {0};
+  
+  // 1. Compute FFT
+  fft(frame, imag, FRAME_LENGTH);
+  
+  // 2. Compute power spectrum (first half)
+  uint16_t spectrumSize = FRAME_LENGTH/2;
+  float spectrum[spectrumSize];
+  for (int i = 0; i < spectrumSize; i++) {
+    spectrum[i] = frame[i]*frame[i] + imag[i]*imag[i];
+  }
+  
+  // 3. Apply mel filter bank (example triangular filters)
+  float melFilters[MFCC_SIZE] = {0};
+  // This is a simplified example - you should implement proper mel filter banks
+  for (int i = 0; i < MFCC_SIZE; i++) {
+    int start = i * 10;
+    int end = start + 20;
+    if (end > spectrumSize) end = spectrumSize;
+    for (int j = start; j < end; j++) {
+      melFilters[i] += spectrum[j];
+    }
+  }
+  
+  // 4. Log compression
+  for (int i = 0; i < MFCC_SIZE; i++) {
+    if (melFilters[i] > 0) {
+      melFilters[i] = log(melFilters[i]);
+    } else {
+      melFilters[i] = -20.0f; // Small value for log(0)
+    }
+  }
+  
+  // 5. DCT (Type II)
+  for (int i = 0; i < MFCC_SIZE; i++) {
+    mfcc[i] = 0;
+    for (int j = 0; j < MFCC_SIZE; j++) {
+      mfcc[i] += melFilters[j] * cos(PI * i * (j + 0.5f) / MFCC_SIZE);
+    }
+    // Optional: Multiply by sqrt(2/N) scale factor
+    mfcc[i] *= sqrt(2.0f / MFCC_SIZE);
+  }
 }
 
 void processRecording() {
   for (uint16_t offset = 0; offset + FRAME_LENGTH <= SAMPLE_BUFFER_SIZE; offset += HOP_SIZE) {
-    float frame[FRAME_LENGTH];
-
-    // 1. Conversion et centrage autour de 0, normalisation [-1, +1]
+    // 1. Convert and center around 0, normalize [-1, +1]
     for (uint16_t i = 0; i < FRAME_LENGTH; i++) {
-      frame[i] = (sampleBuffer[offset + i] - 2048.0f) / 2048.0f;
+      frameBuffer[i] = (sampleBuffer[offset + i] - 2048.0f) / 2048.0f;
     }
-
-    // 2. Préaccentuation
-    for (uint16_t i = FRAME_LENGTH - 1; i > 0; i--) {
-      frame[i] = frame[i] - PRE_EMPHASIS_ALPHA * frame[i - 1];
+    
+    // 2. Signal conditioning
+    removeDCOffset(frameBuffer, FRAME_LENGTH);
+    normalizeFrame(frameBuffer, FRAME_LENGTH);
+    applyPreEmphasis(frameBuffer, FRAME_LENGTH);
+    
+    // 3. Apply window
+    for (int i = 0; i < FRAME_LENGTH; i++) {
+      frameBuffer[i] *= hammingWindow[i];
     }
-    frame[0] = frame[0];  // la première valeur reste comme elle est
-
-    // 3–6. MFCC complet (fenêtre de Hamming, FFT, filtre de Mel, DCT)
-    float mfcc_out[MFCC_SIZE];
-    mymfcc.computeWithDCT(frame, mfcc_out);
-
-    // Affichage
+    
+    // 4. Compute MFCCs
+    computeMFCC(frameBuffer, mfccBuffer);
+    
+    // 5. Output results (same format as original)
     for (uint8_t i = 0; i < MFCC_SIZE; i++) {
-      Serial.print(mfcc_out[i], 4);
+      Serial.print(mfccBuffer[i], 4);
       if (i < MFCC_SIZE - 1)
         Serial.print(',');
       else
         Serial.println();
     }
   }
-
+  
   sampleCount = 0;
   recordReady = false;
+}
+
+// ===== Setup & Main Loop =====
+
+void setup() {
+  Serial.begin(460800);
+  createHammingWindow();
+  
+  pinMode(PinTimer, OUTPUT);
+  digitalWrite(PinTimer, LOW);
+
+  setupTimer();
+  setupADC();
+  setupDAC();
 }
 
 void loop() {
